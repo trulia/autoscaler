@@ -109,6 +109,10 @@ func createAWSManagerInternal(
 		return nil, err
 	}
 
+	if err := manager.adjustMinMaxSize(discoveryOpts.NodeGroupSpecs); err != nil {
+		return nil, err
+	}
+
 	if err := manager.forceRefresh(); err != nil {
 		return nil, err
 	}
@@ -295,6 +299,31 @@ func (m *AwsManager) GetAsgSize(asgConfig *Asg) (int64, error) {
 	return *asg.DesiredCapacity, nil
 }
 
+// GetAsgMinSize gets ASG Minsize and Maxsize.
+func (m *AwsManager) GetAsgMinSize(asgName string, limitToReturn string) (int64, error) {
+	params := &autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: []*string{aws.String(asgName)},
+		MaxRecords:            aws.Int64(1),
+	}
+	groups, err := m.service.DescribeAutoScalingGroups(params)
+
+	if err != nil {
+		return -1, err
+	}
+
+	if len(groups.AutoScalingGroups) < 1 {
+		return -1, fmt.Errorf("Unable to get first autoscaling.Group for %s", asgName)
+	}
+	asg := *groups.AutoScalingGroups[0]
+	if string(limitToReturn) == "MinSize" {
+		return *asg.MinSize, nil
+	}
+	if string(limitToReturn) == "MaxSize" {
+		return *asg.MaxSize, nil
+	}
+	return -1, fmt.Errorf("Unknown limit to return: %s", limitToReturn)
+}
+
 // SetAsgSize sets ASG size.
 func (m *AwsManager) SetAsgSize(asg *Asg, size int64) error {
 	params := &autoscaling.SetDesiredCapacityInput{
@@ -306,6 +335,30 @@ func (m *AwsManager) SetAsgSize(asg *Asg, size int64) error {
 	_, err := m.service.SetDesiredCapacity(params)
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+// Adjust the hard Minsize and Maxsize for ASG based upon spec if actual doesn't match spec
+func (m *AwsManager) adjustMinMaxSize(specs []string) error {
+	for _, spec := range specs {
+		s, err := dynamic.SpecFromString(spec, scaleToZeroSupported)
+		asgMin, err := m.GetAsgMinSize(string(s.Name), string("MinSize"))
+		asgMax, err := m.GetAsgMinSize(string(s.Name), string("MaxSize"))
+
+		// Check to see if the MinSize and MaxSize match our expected ASG spec. If not, set it
+		if asgMin != int64(s.MinSize) || asgMax != int64(s.MaxSize) {
+			params := &autoscaling.UpdateAutoScalingGroupInput{
+				AutoScalingGroupName: aws.String(s.Name),
+				MinSize:              aws.Int64(int64(s.MinSize)),
+				MaxSize:              aws.Int64(int64(s.MaxSize)),
+			}
+			glog.V(0).Infof("Updating asg %s min size to %d, and max size to %d", s.Name, s.MinSize, s.MaxSize)
+			_, error := m.service.SetMinMaxSize(params)
+			if error != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -325,7 +378,7 @@ func (m *AwsManager) DeleteInstances(instances []*AwsRef) error {
 			return err
 		}
 		if asg != commonAsg {
-			return fmt.Errorf("Connot delete instances which don't belong to the same ASG.")
+			return fmt.Errorf("cannot delete instances which don't belong to the same ASG")
 		}
 	}
 
